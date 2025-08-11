@@ -1,0 +1,12 @@
+
+export const runtime = 'nodejs'
+import { NextResponse } from 'next/server'
+import { Pool } from 'pg'
+import crypto from 'crypto'
+const connStr=process.env.DATABASE_URL, secret=process.env.LEADERBOARD_SECRET||''
+const hits:Record<string,number[]> = {}
+function getPool(){ if(!connStr) return null; return new Pool({ connectionString: connStr, ssl: connStr.includes('sslmode=require')?{rejectUnauthorized:false}:undefined }) }
+function okToken(token:any){ if(!token||!token.payload||!token.sig||!secret) return false; const sig2=crypto.createHmac('sha256',secret).update(token.payload).digest('base64url'); if(sig2!==token.sig) return false; const dec=JSON.parse(Buffer.from(token.payload,'base64url').toString('utf8')); return dec.exp && dec.exp >= Math.floor(Date.now()/1000) }
+function rl(ip:string){ const now=Date.now(); hits[ip]=(hits[ip]||[]).filter(t=>now-t<60_000); if(hits[ip].length>30) return false; hits[ip].push(now); return true }
+export async function GET(){ const pool=getPool(); if(!pool) return NextResponse.json({ top: [] },{status:200}); const q=`select team,sum(w)::int as w,sum(l)::int as l,sum(pf)::int as pf,sum(pa)::int as pa from hofn_leaderboard group by team order by sum(w) desc,(sum(pf)-sum(pa)) desc limit 50`; const r=await pool.query(q); await pool.end(); return NextResponse.json({ top: r.rows }) }
+export async function POST(req:Request){ const ip=(req.headers.get('x-forwarded-for')||'').split(',')[0]||'unknown'; if(!rl(ip)) return NextResponse.json({ok:false,error:'rate_limited'},{status:429}); const body=await req.json().catch(()=>({})); const {winner,loser,winnerScore,loserScore,token}=body||{}; if(!okToken(token)) return NextResponse.json({ok:false,error:'bad_token'},{status:400}); if(!winner||!loser) return NextResponse.json({ok:false,error:'missing params'},{status:400}); const pool=getPool(); if(!pool) return NextResponse.json({ok:false,reason:'no-db'},{status:200}); const client=await pool.connect(); try{ await client.query('BEGIN'); await client.query('insert into hofn_leaderboard(team,w,l,pf,pa) values($1,1,0,$2,$3)',[winner,winnerScore||0,loserScore||0]); await client.query('insert into hofn_leaderboard(team,w,l,pf,pa) values($1,0,1,$2,$3)',[loser,loserScore||0,winnerScore||0]); await client.query('COMMIT') }catch(e){ await client.query('ROLLBACK'); console.error(e); return NextResponse.json({ok:false,error:'db-failure'},{status:500}) }finally{ client.release(); await pool.end() } return NextResponse.json({ok:true}) }
